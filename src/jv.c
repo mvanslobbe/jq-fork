@@ -1341,7 +1341,16 @@ int jv_string_length_codepoints(jv j) {
   const char* i = jv_string_value(j);
   const char* end = i + jv_string_length_bytes(jv_copy(j));
   int c = 0, len = 0;
-  while ((i = jvp_utf8_next(i, end, &c))) len++;
+  while (i < end) {
+    // Each ASCII byte is one codepoint; decode only the rest.
+    const char* ascii_end = jvp_utf8_skip_ascii(i, end);
+    len += (int)(ascii_end - i);
+    i = ascii_end;
+    while (i < end && (*i & 0x80)) {
+      i = jvp_utf8_next(i, end, &c);
+      len++;
+    }
+  }
   jv_free(j);
   return len;
 }

@@ -109,6 +109,10 @@ map(tojson)
 null
 true
 
+map(length)
+["abcdefghé", "日本語abcdefghij😀", "abcdefghijklmnopq"]
+[9,14,17]
+
 #
 # Dictionary construction syntax
 #
@@ -2687,6 +2691,46 @@ try ["ok", setpath([1]; 1)] catch ["ko", .]
 try fromjson catch .
 "{'a': 123}"
 "Invalid string literal; expected \", but got ' at line 1, column 5 (while parsing '{'a': 123}')"
+
+# The error position is kept when a string is scanned a run at a time
+.[] | try fromjson catch .
+["\"abcdefghijk\u0001\"", "[\"abcdefghij\",\n\"abcdefghijklmnopqrst\u0001\"]"]
+"Invalid string: control characters from U+0000 through U+001F must be escaped at line 1, column 14 (while parsing '\"abcdefghijk\u0001\"')"
+"Invalid string: control characters from U+0000 through U+001F must be escaped at line 2, column 23 (while parsing '[\"abcdefghij\",\n\"abcdefghijklmnopqrst\u0001\"]')"
+
+# A long string grows the token buffer several times in one step
+"ab" * 150000 | tojson | fromjson | length
+null
+300000
+
+# The error position is kept when a literal is scanned a run at a time
+.[] | try fromjson catch .
+["[1,tru]", "[123456789,truex]", "{\"a\":12a3}", "[1.5e3,nul]"]
+"Invalid literal at line 1, column 7 (while parsing '[1,tru]')"
+"Invalid literal at line 1, column 17 (while parsing '[123456789,truex]')"
+"Invalid numeric literal at line 1, column 10 (while parsing '{\"a\":12a3}')"
+"Invalid literal at line 1, column 11 (while parsing '[1.5e3,nul]')"
+
+# A literal ends at every byte that is not part of a literal
+.[] | try (fromjson | tojson) catch .
+["[1,2]", "[1 ]", "[1\t]", "[1\r]", "[1\n]", "{\"a\":1}", "{\"a\":true}", "1[", "1{", "1\"", "1:", "1\u0000"]
+"[1,2]"
+"[1]"
+"[1]"
+"[1]"
+"[1]"
+"{\"a\":1}"
+"{\"a\":true}"
+"Unfinished JSON term at EOF at line 1, column 2 (while parsing '1[')"
+"Unfinished JSON term at EOF at line 1, column 2 (while parsing '1{')"
+"Unfinished string at EOF at line 1, column 2 (while parsing '1\"')"
+"Expected string key before ':' at line 1, column 2 (while parsing '1:')"
+"Invalid character at line 1, column 2 (while parsing '1')"
+
+# A long number grows the token buffer
+"1" * 300 | fromjson | tojson | length
+null
+300
 
 # ltrimstr/1 rtrimstr/1 don't leak on invalid input #2977
 

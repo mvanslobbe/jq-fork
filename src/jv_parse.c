@@ -418,17 +418,54 @@ static pfunc stream_token(struct jv_parser* p, char ch) {
   return 0;
 }
 
+// Doubles the token buffer.  Returns 0 if the token would grow too long.
+static int token_grow(struct jv_parser* p) {
+  if (p->tokenlen > INT_MAX / 2)
+    return 0;
+  p->tokenlen *= 2;
+  p->tokenbuf = jv_mem_realloc(p->tokenbuf, p->tokenlen);
+  return 1;
+}
+
 static pfunc tokenadd(struct jv_parser* p, char c) {
   assert(p->tokenpos <= p->tokenlen);
-  if (p->tokenpos >= (p->tokenlen - 1)) {
-    if (p->tokenlen > INT_MAX / 2)
-      return "Token too long";
-    p->tokenlen *= 2;
-    p->tokenbuf = jv_mem_realloc(p->tokenbuf, p->tokenlen);
-  }
+  if (p->tokenpos >= (p->tokenlen - 1) && !token_grow(p))
+    return "Token too long";
   assert(p->tokenpos < p->tokenlen);
   p->tokenbuf[p->tokenpos++] = c;
   return 0;
+}
+
+// Appends n bytes to the token, as n calls to tokenadd() would.  Returns 0
+// without appending anything if the token would grow too long (the buffer
+// may have grown even then), so that the caller can fall back to tokenadd()
+// and report the error at the right byte.
+static int tokenadd_buf(struct jv_parser* p, const char* s, int n) {
+  assert(p->tokenpos <= p->tokenlen);
+  // Keep one byte spare, as tokenadd() does, for the NUL that
+  // check_literal() appends.
+  while ((long long)p->tokenpos + n > p->tokenlen - 1)
+    if (!token_grow(p))
+      return 0;
+  memcpy(p->tokenbuf + p->tokenpos, s, n);
+  p->tokenpos += n;
+  return 1;
+}
+
+// Returns the length of the run at s of string contents that scan() would
+// only append to the token: bytes other than '"', '\\', '\n' (which moves
+// the line count) and RS (which resyncs a JSON text sequence).  Keep the
+// table in sync with the bytes that scan() handles inside a string.
+static int string_run_length(const char* s, int n) {
+  // A table rather than four comparisons: compilers turn the comparisons
+  // into a range check that mispredicts on ordinary text.
+  static const unsigned char stop[256] = {
+    ['"'] = 1, ['\\'] = 1, ['\n'] = 1, ['\036'] = 1,
+  };
+  int i = 0;
+  while (i < n && !stop[(unsigned char)s[i]])
+    i++;
+  return i;
 }
 
 static int unhex4(char* hex) {
@@ -559,6 +596,8 @@ typedef enum {
   INVALID
 } chclass;
 
+// literal_run() copies literals without calling this function: its stop[]
+// table must hold every byte that is not LITERAL here.
 static chclass classify(char c) {
   switch (c) {
   case '\0':
@@ -649,6 +688,37 @@ static int stream_is_top_num(struct jv_parser* p) {
 #define is_top_num(p) \
    (((p)->flags & JV_PARSE_STREAMING) ? stream_is_top_num((p)) : parse_is_top_num((p)))
 
+// Appends the rest of a literal (a number, true, false or null) to the token
+// straight from the input buffer.  Nothing can complete a value in the middle
+// of a literal, so the bytes need not pass through scan() one by one.
+// Literals are short, so the bytes are copied in a loop rather than with
+// memcpy().  The copy stops where the token buffer is full; scan() then grows
+// the buffer or reports that the token is too long.  Not inlined: inlined
+// into scan(), gcc lays out jv_parser_next() worse and text gets slower.
+static __attribute__((noinline)) void literal_run(struct jv_parser* p) {
+  // Every byte that classify() does not treat as LITERAL, and RS.  Keep
+  // this in sync with classify(): a byte missing here would be copied into
+  // the literal instead of ending it.
+  static const unsigned char stop[256] = {
+    ['\0'] = 1, [' '] = 1, ['\t'] = 1, ['\r'] = 1, ['\n'] = 1, ['"'] = 1,
+    ['['] = 1, [','] = 1, [']'] = 1, ['{'] = 1, [':'] = 1, ['}'] = 1,
+    ['\036'] = 1,
+  };
+  const char* s = p->curr_buf + p->curr_buf_pos;
+  char* d = p->tokenbuf + p->tokenpos;
+  int n = p->curr_buf_length - p->curr_buf_pos;
+  if (n > p->tokenlen - 1 - p->tokenpos)
+    n = p->tokenlen - 1 - p->tokenpos;
+  int i = 0;
+  while (i < n && !stop[(unsigned char)s[i]]) {
+    d[i] = s[i];
+    i++;
+  }
+  p->tokenpos += i;
+  p->curr_buf_pos += i;
+  p->column += i;
+}
+
 static pfunc scan(struct jv_parser* p, char ch, jv* out) {
   p->column++;
   if (ch == '\n') {
@@ -685,6 +755,7 @@ static pfunc scan(struct jv_parser* p, char ch, jv* out) {
     switch (cls) {
     case LITERAL:
       TRY(tokenadd(p, ch));
+      literal_run(p);
       break;
     case WHITESPACE:
       break;
@@ -764,6 +835,7 @@ jv jv_parser_next(struct jv_parser* p) {
     return value;
   char ch;
   presult msg = 0;
+  int string_fast_path = 1;
   while (!msg && p->curr_buf_pos < p->curr_buf_length) {
     ch = p->curr_buf[p->curr_buf_pos++];
     if (p->st == JV_PARSER_WAITING_FOR_RS) {
@@ -778,6 +850,21 @@ jv jv_parser_next(struct jv_parser* p) {
       continue; // need to resync, wait for RS
     }
     msg = scan(p, ch, &value);
+    if (!msg && p->st == JV_PARSER_STRING && string_fast_path) {
+      // Inside a string, copy the run of plain bytes in one step.
+      int n = string_run_length(p->curr_buf + p->curr_buf_pos,
+                                p->curr_buf_length - p->curr_buf_pos);
+      if (n > 0) {
+        if (tokenadd_buf(p, p->curr_buf + p->curr_buf_pos, n)) {
+          p->curr_buf_pos += n;
+          p->column += n;
+        } else {
+          // The token is at its size limit: let scan() add the bytes one by
+          // one, so that it reports the error at the right byte.
+          string_fast_path = 0;
+        }
+      }
+    }
   }
   if (msg == OK) {
     return value;

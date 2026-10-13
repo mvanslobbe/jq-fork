@@ -1004,4 +1004,18 @@ if $JQ -nf "$d/nul_modulemeta.jq" >/dev/null 2>/dev/null; then
   exit 1
 fi
 
+# Strings that span several input buffers parse the same
+$JQ -n '"ab" * 5000 + "\n\u00e9\"\\\u0001" + "cd" * 5000 | [., .]' > $d/long.json
+if [ "$($JQ -c 'map(length)' $d/long.json)" != "[20005,20005]" ]; then
+  printf 'Long string spanning input buffers parsed incorrectly\n' 1>&2
+  exit 1
+fi
+$JQ . $d/long.json > $d/long.out
+cmp $d/long.out $d/long.json
+
+# Numbers and literals that span several input buffers parse the same
+$JQ -nc '[range(3000) | -(. * 1.25e-3), true, false, null]' > $d/nums.json
+$JQ -c . $d/nums.json > $d/nums.out
+cmp $d/nums.out $d/nums.json
+
 exit 0
