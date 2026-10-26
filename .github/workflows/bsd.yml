@@ -59,7 +59,7 @@ jobs:
           usesh: true
           cache-after-prepare: true
           prepare: |
-            pkg_add autoconf automake libtool gmake git
+            pkg_add -uu autoconf automake libtool gmake git
           run: |
             set -e
             # The VM runs as root over a checkout owned by another uid, so git
